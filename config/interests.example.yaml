@@ -1,0 +1,50 @@
+interests:
+  primary:
+    - topic: "swimming"
+      subreddits:
+        - "r/Swimming"
+        - "r/swimmingcoach"
+        - "r/openwater"
+      keywords:
+        - "freestyle"
+        - "backstroke"
+        - "training plan"
+        - "swim meet"
+    - topic: "immigration"
+      subreddits:
+        - "r/immigration"
+        - "r/uscis"
+        - "r/newtoamerica"
+      keywords:
+        - "green card"
+        - "visa"
+        - "adjustment of status"
+    - topic: "ai/llm"
+      subreddits:
+        - "r/LocalLLaMA"
+        - "r/MachineLearning"
+        - "r/ClaudeAI"
+      keywords:
+        - "llm"
+        - "fine-tuning"
+        - "rag"
+        - "embedding"
+  secondary:
+    - topic: "parenting"
+      subreddits:
+        - "r/Parenting"
+        - "r/daddit"
+      keywords:
+        - "school"
+        - "kids"
+        - "routine"
+    - topic: "tech"
+      subreddits:
+        - "r/programming"
+        - "r/Python"
+      keywords:
+        - "python"
+        - "javascript"
+        - "api"
+  similarity_threshold: 0.65
+
