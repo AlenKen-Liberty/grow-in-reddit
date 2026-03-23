@@ -15,8 +15,10 @@ class Post:
     url: str
     subreddit: str
     title: str
+    id: str | None = None
     body: str = ""
     author: str = ""
+    author_karma: int | None = None
     score: int = 0
     num_comments: int = 0
     created_utc: datetime = field(default_factory=utc_now)
@@ -71,6 +73,15 @@ class ActionLog:
 
 
 @dataclass(slots=True)
+class BrowseAction:
+    action: str
+    target_url: str
+    subreddit: str | None = None
+    note: str | None = None
+    timestamp: datetime = field(default_factory=utc_now)
+
+
+@dataclass(slots=True)
 class AccountSnapshot:
     day: date
     karma_post: int
@@ -92,6 +103,19 @@ class TrackedPost:
     comment_count_at_post: int = 0
     comment_count_latest: int = 0
     is_active: bool = True
+
+
+@dataclass(slots=True)
+class SeenComment:
+    comment_id: str
+    post_url: str
+    author: str | None = None
+    body_preview: str = ""
+    first_seen_at: datetime = field(default_factory=utc_now)
+    is_direct_reply: bool = False
+    replied_at: datetime | None = None
+    reply_comment_id: str | None = None
+    reply_status: str = "pending"
 
 
 @dataclass(slots=True)
@@ -169,4 +193,38 @@ class ContentInsight:
     is_active: bool = True
     created_at: datetime = field(default_factory=utc_now)
     superseded_by: int | None = None
+    id: int | None = None
+
+
+@dataclass(slots=True)
+class CommunitySnapshot:
+    subreddit: str
+    post_url: str
+    title: str
+    author: str | None = None
+    flair: str | None = None
+    score_at_capture: int | None = None
+    score_after_24h: int | None = None
+    comment_count_at_capture: int | None = None
+    comment_count_after_24h: int | None = None
+    posted_at: datetime | None = None
+    captured_at: datetime = field(default_factory=utc_now)
+    was_removed: bool = False
+    removal_detected_at: datetime | None = None
+    mod_comment: str | None = None
+    body_preview: str = ""
+    id: int | None = None
+
+
+@dataclass(slots=True)
+class CommunityPowerUser:
+    subreddit: str
+    username: str
+    role: str = "contributor"
+    estimated_karma: int | None = None
+    post_count: int = 0
+    avg_score: float = 0.0
+    content_style: str | None = None
+    notes: str | None = None
+    last_updated: datetime = field(default_factory=utc_now)
     id: int | None = None

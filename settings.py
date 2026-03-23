@@ -34,6 +34,8 @@ class Settings:
     ollama_url: str | None
     ollama_model: str
     llm_provider: str
+    llm_base_url: str
+    llm_model: str
     claude_api_key: str | None
     gemini_api_key: str | None
 
@@ -70,7 +72,9 @@ class Settings:
             ),
             ollama_url=os.getenv("OLLAMA_URL"),
             ollama_model=os.getenv("OLLAMA_MODEL", "qwen3-embedding:0.6b"),
-            llm_provider=os.getenv("LLM_PROVIDER", "claude"),
+            llm_provider=os.getenv("LLM_PROVIDER", "chat2api"),
+            llm_base_url=os.getenv("LLM_BASE_URL", "http://127.0.0.1:7860"),
+            llm_model=os.getenv("LLM_MODEL", "gemini-thinking"),
             claude_api_key=os.getenv("CLAUDE_API_KEY"),
             gemini_api_key=os.getenv("GEMINI_API_KEY"),
         )

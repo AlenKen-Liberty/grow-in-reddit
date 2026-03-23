@@ -13,10 +13,13 @@ from .models import (
     ActionOutcome,
     AccountSnapshot,
     Comment,
+    CommunityPowerUser,
+    CommunitySnapshot,
     ContentInsight,
     InterestTopic,
     PlaybookEntry,
     Post,
+    SeenComment,
     TrackedPost,
     SubredditProfile,
 )
@@ -62,6 +65,27 @@ SCHEMA_STATEMENTS = [
         comment_count_latest INTEGER DEFAULT 0,
         is_active BOOLEAN DEFAULT 1
     )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS seen_comments (
+        comment_id TEXT PRIMARY KEY,
+        post_url TEXT NOT NULL,
+        author TEXT,
+        body_preview TEXT,
+        first_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
+        is_direct_reply BOOLEAN DEFAULT 0,
+        replied_at TEXT,
+        reply_comment_id TEXT,
+        reply_status TEXT NOT NULL DEFAULT 'pending'
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_seen_post
+    ON seen_comments(post_url)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_seen_status
+    ON seen_comments(reply_status)
     """,
     """
     CREATE TABLE IF NOT EXISTS subreddit_profile (
@@ -172,12 +196,18 @@ SCHEMA_STATEMENTS = [
     ON community_snapshot(subreddit, captured_at)
     """,
     """
+    CREATE INDEX IF NOT EXISTS idx_snap_revisit
+    ON community_snapshot(score_after_24h, captured_at)
+    """,
+    """
     CREATE TABLE IF NOT EXISTS community_power_users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         subreddit TEXT NOT NULL,
         username TEXT NOT NULL,
         role TEXT DEFAULT 'contributor',
         estimated_karma INTEGER,
+        post_count INTEGER DEFAULT 0,
+        avg_score REAL DEFAULT 0,
         post_frequency TEXT,
         content_style TEXT,
         typical_topics TEXT,
@@ -315,7 +345,21 @@ class SQLiteStore:
         with self._lock:
             for statement in SCHEMA_STATEMENTS:
                 self._conn.execute(statement)
+            self._apply_migrations()
             self._conn.commit()
+
+    def _apply_migrations(self) -> None:
+        self._ensure_column("community_power_users", "post_count", "INTEGER DEFAULT 0")
+        self._ensure_column("community_power_users", "avg_score", "REAL DEFAULT 0")
+
+    def _ensure_column(self, table: str, column: str, definition: str) -> None:
+        columns = {
+            row["name"]
+            for row in self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        if column in columns:
+            return
+        self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     def log_action(self, action: ActionLog) -> int:
         with self._lock:
@@ -467,6 +511,125 @@ class SQLiteStore:
         sql += " ORDER BY posted_at DESC"
         rows = self._conn.execute(sql, args).fetchall()
         return [self._row_to_tracked_post(row) for row in rows]
+
+    def mark_tracked_post_checked(
+        self,
+        url: str,
+        *,
+        comment_count_latest: int,
+        is_active: bool | None = None,
+        checked_at: datetime | None = None,
+    ) -> None:
+        assignments = ["last_checked = ?", "comment_count_latest = ?"]
+        args: list[Any] = [_to_iso(checked_at or utc_now()), comment_count_latest]
+        if is_active is not None:
+            assignments.append("is_active = ?")
+            args.append(int(is_active))
+        args.append(url)
+        with self._lock:
+            self._conn.execute(
+                f"UPDATE tracked_posts SET {', '.join(assignments)} WHERE url = ?",
+                args,
+            )
+            self._conn.commit()
+
+    def upsert_seen_comment(self, seen_comment: SeenComment) -> None:
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO seen_comments (
+                    comment_id, post_url, author, body_preview, first_seen_at,
+                    is_direct_reply, replied_at, reply_comment_id, reply_status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(comment_id) DO UPDATE SET
+                    post_url = excluded.post_url,
+                    author = excluded.author,
+                    body_preview = excluded.body_preview,
+                    is_direct_reply = excluded.is_direct_reply,
+                    replied_at = COALESCE(excluded.replied_at, seen_comments.replied_at),
+                    reply_comment_id = COALESCE(
+                        excluded.reply_comment_id, seen_comments.reply_comment_id
+                    ),
+                    reply_status = CASE
+                        WHEN seen_comments.reply_status = 'replied'
+                        THEN seen_comments.reply_status
+                        ELSE excluded.reply_status
+                    END
+                """,
+                (
+                    seen_comment.comment_id,
+                    seen_comment.post_url,
+                    seen_comment.author,
+                    seen_comment.body_preview,
+                    _to_iso(seen_comment.first_seen_at),
+                    int(seen_comment.is_direct_reply),
+                    _to_iso(seen_comment.replied_at),
+                    seen_comment.reply_comment_id,
+                    seen_comment.reply_status,
+                ),
+            )
+            self._conn.commit()
+
+    def get_seen_comment(self, comment_id: str) -> SeenComment | None:
+        row = self._conn.execute(
+            "SELECT * FROM seen_comments WHERE comment_id = ?",
+            (comment_id,),
+        ).fetchone()
+        return None if row is None else self._row_to_seen_comment(row)
+
+    def get_seen_comment_ids(self, post_url: str) -> set[str]:
+        rows = self._conn.execute(
+            "SELECT comment_id FROM seen_comments WHERE post_url = ?",
+            (post_url,),
+        ).fetchall()
+        return {str(row["comment_id"]) for row in rows}
+
+    def list_seen_comments(
+        self,
+        *,
+        post_url: str | None = None,
+        reply_status: str | None = None,
+        limit: int = 500,
+    ) -> list[SeenComment]:
+        clauses: list[str] = []
+        args: list[Any] = []
+        if post_url:
+            clauses.append("post_url = ?")
+            args.append(post_url)
+        if reply_status:
+            clauses.append("reply_status = ?")
+            args.append(reply_status)
+        sql = "SELECT * FROM seen_comments"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY first_seen_at DESC LIMIT ?"
+        args.append(limit)
+        rows = self._conn.execute(sql, args).fetchall()
+        return [self._row_to_seen_comment(row) for row in rows]
+
+    def mark_seen_comment_replied(
+        self,
+        comment_id: str,
+        *,
+        reply_comment_id: str | None = None,
+        reply_status: str = "replied",
+        replied_at: datetime | None = None,
+    ) -> None:
+        with self._lock:
+            self._conn.execute(
+                """
+                UPDATE seen_comments
+                SET replied_at = ?, reply_comment_id = ?, reply_status = ?
+                WHERE comment_id = ?
+                """,
+                (
+                    _to_iso(replied_at or utc_now()),
+                    reply_comment_id,
+                    reply_status,
+                    comment_id,
+                ),
+            )
+            self._conn.commit()
 
     def upsert_subreddit_profile(self, profile: SubredditProfile) -> None:
         with self._lock:
@@ -776,6 +939,189 @@ class SQLiteStore:
         ).fetchall()
         return [self._row_to_playbook_entry(row) for row in rows]
 
+    def upsert_community_snapshot(self, snapshot: CommunitySnapshot) -> int:
+        captured_day = snapshot.captured_at.date().isoformat()
+        existing = self._conn.execute(
+            """
+            SELECT id FROM community_snapshot
+            WHERE subreddit = ? AND post_url = ? AND date(captured_at) = ?
+            ORDER BY captured_at DESC
+            LIMIT 1
+            """,
+            (snapshot.subreddit, snapshot.post_url, captured_day),
+        ).fetchone()
+        with self._lock:
+            if existing is None:
+                cursor = self._conn.execute(
+                    """
+                    INSERT INTO community_snapshot (
+                        subreddit, post_url, title, author, flair,
+                        score_at_capture, score_after_24h,
+                        comment_count_at_capture, comment_count_after_24h,
+                        posted_at, captured_at, was_removed,
+                        removal_detected_at, mod_comment, body_preview
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        snapshot.subreddit,
+                        snapshot.post_url,
+                        snapshot.title,
+                        snapshot.author,
+                        snapshot.flair,
+                        snapshot.score_at_capture,
+                        snapshot.score_after_24h,
+                        snapshot.comment_count_at_capture,
+                        snapshot.comment_count_after_24h,
+                        _to_iso(snapshot.posted_at),
+                        _to_iso(snapshot.captured_at),
+                        int(snapshot.was_removed),
+                        _to_iso(snapshot.removal_detected_at),
+                        snapshot.mod_comment,
+                        snapshot.body_preview,
+                    ),
+                )
+                self._conn.commit()
+                return int(cursor.lastrowid)
+
+            snapshot_id = int(existing["id"])
+            self._conn.execute(
+                """
+                UPDATE community_snapshot
+                SET title = ?, author = ?, flair = ?, score_at_capture = ?,
+                    posted_at = ?, comment_count_at_capture = ?,
+                    body_preview = ?, captured_at = ?
+                WHERE id = ?
+                """,
+                (
+                    snapshot.title,
+                    snapshot.author,
+                    snapshot.flair,
+                    snapshot.score_at_capture,
+                    _to_iso(snapshot.posted_at),
+                    snapshot.comment_count_at_capture,
+                    snapshot.body_preview,
+                    _to_iso(snapshot.captured_at),
+                    snapshot_id,
+                ),
+            )
+            self._conn.commit()
+            return snapshot_id
+
+    def list_snapshot_candidates_for_revisit(
+        self, *, hours_ago: int = 24, limit: int = 500
+    ) -> list[CommunitySnapshot]:
+        cutoff = utc_now() - timedelta(hours=hours_ago)
+        rows = self._conn.execute(
+            """
+            SELECT * FROM community_snapshot
+            WHERE captured_at <= ?
+              AND score_after_24h IS NULL
+              AND was_removed = 0
+            ORDER BY captured_at ASC
+            LIMIT ?
+            """,
+            (_to_iso(cutoff), limit),
+        ).fetchall()
+        return [self._row_to_community_snapshot(row) for row in rows]
+
+    def update_community_snapshot_revisit(
+        self,
+        snapshot_id: int,
+        *,
+        score_after_24h: int | None = None,
+        comment_count_after_24h: int | None = None,
+        was_removed: bool = False,
+        mod_comment: str | None = None,
+        removal_detected_at: datetime | None = None,
+    ) -> None:
+        with self._lock:
+            self._conn.execute(
+                """
+                UPDATE community_snapshot
+                SET score_after_24h = ?,
+                    comment_count_after_24h = ?,
+                    was_removed = ?,
+                    mod_comment = COALESCE(?, mod_comment),
+                    removal_detected_at = ?
+                WHERE id = ?
+                """,
+                (
+                    score_after_24h,
+                    comment_count_after_24h,
+                    int(was_removed),
+                    mod_comment,
+                    _to_iso(removal_detected_at),
+                    snapshot_id,
+                ),
+            )
+            self._conn.commit()
+
+    def list_community_snapshots(
+        self,
+        *,
+        subreddit: str | None = None,
+        removed_only: bool = False,
+        limit: int = 500,
+    ) -> list[CommunitySnapshot]:
+        clauses: list[str] = []
+        args: list[Any] = []
+        if subreddit:
+            clauses.append("subreddit = ?")
+            args.append(subreddit)
+        if removed_only:
+            clauses.append("was_removed = 1")
+        sql = "SELECT * FROM community_snapshot"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY captured_at DESC LIMIT ?"
+        args.append(limit)
+        rows = self._conn.execute(sql, args).fetchall()
+        return [self._row_to_community_snapshot(row) for row in rows]
+
+    def upsert_community_power_user(self, profile: CommunityPowerUser) -> None:
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO community_power_users (
+                    subreddit, username, role, estimated_karma, post_count,
+                    avg_score, content_style, notes, last_updated
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(subreddit, username) DO UPDATE SET
+                    role = excluded.role,
+                    estimated_karma = excluded.estimated_karma,
+                    post_count = excluded.post_count,
+                    avg_score = excluded.avg_score,
+                    content_style = excluded.content_style,
+                    notes = excluded.notes,
+                    last_updated = excluded.last_updated
+                """,
+                (
+                    profile.subreddit,
+                    profile.username,
+                    profile.role,
+                    profile.estimated_karma,
+                    profile.post_count,
+                    profile.avg_score,
+                    profile.content_style,
+                    profile.notes,
+                    _to_iso(profile.last_updated),
+                ),
+            )
+            self._conn.commit()
+
+    def list_community_power_users(
+        self, *, subreddit: str | None = None, limit: int = 50
+    ) -> list[CommunityPowerUser]:
+        sql = "SELECT * FROM community_power_users"
+        args: list[Any] = []
+        if subreddit:
+            sql += " WHERE subreddit = ?"
+            args.append(subreddit)
+        sql += " ORDER BY avg_score DESC, post_count DESC, username ASC LIMIT ?"
+        args.append(limit)
+        rows = self._conn.execute(sql, args).fetchall()
+        return [self._row_to_community_power_user(row) for row in rows]
+
     def add_content_insight(self, insight: ContentInsight) -> int:
         with self._lock:
             cursor = self._conn.execute(
@@ -975,6 +1321,20 @@ class SQLiteStore:
         )
 
     @staticmethod
+    def _row_to_seen_comment(row: sqlite3.Row) -> SeenComment:
+        return SeenComment(
+            comment_id=row["comment_id"],
+            post_url=row["post_url"],
+            author=row["author"],
+            body_preview=row["body_preview"] or "",
+            first_seen_at=_parse_datetime(row["first_seen_at"]) or utc_now(),
+            is_direct_reply=bool(row["is_direct_reply"]),
+            replied_at=_parse_datetime(row["replied_at"]),
+            reply_comment_id=row["reply_comment_id"],
+            reply_status=row["reply_status"] or "pending",
+        )
+
+    @staticmethod
     def _row_to_subreddit_profile(row: sqlite3.Row) -> SubredditProfile:
         return SubredditProfile(
             name=row["name"],
@@ -1044,6 +1404,42 @@ class SQLiteStore:
         )
 
     @staticmethod
+    def _row_to_community_snapshot(row: sqlite3.Row) -> CommunitySnapshot:
+        return CommunitySnapshot(
+            id=int(row["id"]),
+            subreddit=row["subreddit"],
+            post_url=row["post_url"],
+            title=row["title"],
+            author=row["author"],
+            flair=row["flair"],
+            score_at_capture=row["score_at_capture"],
+            score_after_24h=row["score_after_24h"],
+            comment_count_at_capture=row["comment_count_at_capture"],
+            comment_count_after_24h=row["comment_count_after_24h"],
+            posted_at=_parse_datetime(row["posted_at"]),
+            captured_at=_parse_datetime(row["captured_at"]) or utc_now(),
+            was_removed=bool(row["was_removed"]),
+            removal_detected_at=_parse_datetime(row["removal_detected_at"]),
+            mod_comment=row["mod_comment"],
+            body_preview=row["body_preview"] or "",
+        )
+
+    @staticmethod
+    def _row_to_community_power_user(row: sqlite3.Row) -> CommunityPowerUser:
+        return CommunityPowerUser(
+            id=int(row["id"]),
+            subreddit=row["subreddit"],
+            username=row["username"],
+            role=row["role"] or "contributor",
+            estimated_karma=row["estimated_karma"],
+            post_count=int(row["post_count"] or 0),
+            avg_score=float(row["avg_score"] or 0.0),
+            content_style=row["content_style"],
+            notes=row["notes"],
+            last_updated=_parse_datetime(row["last_updated"]) or utc_now(),
+        )
+
+    @staticmethod
     def _row_to_content_insight(row: sqlite3.Row) -> ContentInsight:
         return ContentInsight(
             id=int(row["id"]),
@@ -1065,8 +1461,10 @@ class SQLiteStore:
             url=row["url"],
             subreddit=row["subreddit"],
             title=row["title"],
+            id=None,
             body=row["body"] or "",
             author=row["author"] or "",
+            author_karma=None,
             score=int(row["score"] or 0),
             num_comments=int(row["num_comments"] or 0),
             created_utc=_parse_datetime(row["created_utc"]) or utc_now(),

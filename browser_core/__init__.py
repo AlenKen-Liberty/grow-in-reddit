@@ -1,1 +1,3 @@
-"""Browser core package placeholder for future CDP integration."""
+from .cdp_browser import CdpBrowser, CdpBrowserError
+
+__all__ = ["CdpBrowser", "CdpBrowserError"]

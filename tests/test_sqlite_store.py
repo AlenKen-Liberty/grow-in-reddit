@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from storage import ActionLog, SQLiteStore
+from storage import ActionLog, SQLiteStore, SeenComment
 
 
 class SQLiteStoreTest(unittest.TestCase):
@@ -41,6 +41,24 @@ class SQLiteStoreTest(unittest.TestCase):
         self.assertEqual(len(topics), 1)
         self.assertEqual(topics[0].topic, "swimming")
         self.assertGreaterEqual(topics[0].weight, 0.2)
+
+    def test_seen_comment_round_trip(self) -> None:
+        self.store.upsert_seen_comment(
+            SeenComment(
+                comment_id="t1_abc",
+                post_url="https://reddit.test/r/swimming/comments/1",
+                author="helper",
+                body_preview="Useful answer",
+                is_direct_reply=True,
+            )
+        )
+
+        seen = self.store.get_seen_comment("t1_abc")
+
+        self.assertIsNotNone(seen)
+        assert seen is not None
+        self.assertTrue(seen.is_direct_reply)
+        self.assertEqual(seen.reply_status, "pending")
 
 
 if __name__ == "__main__":
