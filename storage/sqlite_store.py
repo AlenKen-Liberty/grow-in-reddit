@@ -19,6 +19,7 @@ from .models import (
     InterestTopic,
     PlaybookEntry,
     Post,
+    ScheduleLogEntry,
     SeenComment,
     TrackedPost,
     SubredditProfile,
@@ -420,6 +421,12 @@ class SQLiteStore:
         rows = self._conn.execute(sql, args).fetchall()
         return {row["action_type"]: int(row["count"]) for row in rows}
 
+    def get_oldest_action(self) -> ActionLog | None:
+        row = self._conn.execute(
+            "SELECT * FROM action_log ORDER BY timestamp ASC LIMIT 1"
+        ).fetchone()
+        return None if row is None else self._row_to_action_log(row)
+
     def record_account_snapshot(self, snapshot: AccountSnapshot) -> None:
         with self._lock:
             self._conn.execute(
@@ -464,6 +471,99 @@ class SQLiteStore:
             total_posts=int(row["total_posts"] or 0),
             total_comments=int(row["total_comments"] or 0),
         )
+
+    def list_account_snapshots(
+        self, *, days: int | None = None, limit: int = 365
+    ) -> list[AccountSnapshot]:
+        clauses: list[str] = []
+        args: list[Any] = []
+        if days is not None:
+            cutoff = (utc_now() - timedelta(days=days)).date().isoformat()
+            clauses.append("date >= ?")
+            args.append(cutoff)
+        sql = "SELECT * FROM account_snapshot"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY date DESC LIMIT ?"
+        args.append(limit)
+        rows = self._conn.execute(sql, args).fetchall()
+        return [
+            AccountSnapshot(
+                id=int(row["id"]),
+                day=_parse_date(row["date"]) or date.today(),
+                karma_post=int(row["karma_post"]),
+                karma_comment=int(row["karma_comment"]),
+                karma_total=int(row["karma_total"]),
+                active_subreddits=int(row["active_subreddits"] or 0),
+                total_posts=int(row["total_posts"] or 0),
+                total_comments=int(row["total_comments"] or 0),
+            )
+            for row in rows
+        ]
+
+    def upsert_schedule_log(self, entry: ScheduleLogEntry) -> int:
+        row = self._conn.execute(
+            "SELECT id FROM schedule_log WHERE date = ? ORDER BY id DESC LIMIT 1",
+            (_to_iso(entry.day),),
+        ).fetchone()
+        with self._lock:
+            if row is None:
+                cursor = self._conn.execute(
+                    """
+                    INSERT INTO schedule_log (
+                        date, planned_actions_json, executed_actions_json, skipped_reason
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        _to_iso(entry.day),
+                        _json_dumps(entry.planned_actions or {}),
+                        _json_dumps(entry.executed_actions or {}),
+                        entry.skipped_reason,
+                    ),
+                )
+                self._conn.commit()
+                return int(cursor.lastrowid)
+            schedule_id = int(row["id"])
+            self._conn.execute(
+                """
+                UPDATE schedule_log
+                SET planned_actions_json = ?,
+                    executed_actions_json = ?,
+                    skipped_reason = ?
+                WHERE id = ?
+                """,
+                (
+                    _json_dumps(entry.planned_actions or {}),
+                    _json_dumps(entry.executed_actions or {}),
+                    entry.skipped_reason,
+                    schedule_id,
+                ),
+            )
+            self._conn.commit()
+            return schedule_id
+
+    def get_schedule_log(self, day: date) -> ScheduleLogEntry | None:
+        row = self._conn.execute(
+            "SELECT * FROM schedule_log WHERE date = ? ORDER BY id DESC LIMIT 1",
+            (_to_iso(day),),
+        ).fetchone()
+        return None if row is None else self._row_to_schedule_log(row)
+
+    def list_schedule_logs(
+        self, *, limit: int = 30, days: int | None = None
+    ) -> list[ScheduleLogEntry]:
+        clauses: list[str] = []
+        args: list[Any] = []
+        if days is not None:
+            clauses.append("date >= ?")
+            args.append((utc_now() - timedelta(days=days)).date().isoformat())
+        sql = "SELECT * FROM schedule_log"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY date DESC, id DESC LIMIT ?"
+        args.append(limit)
+        rows = self._conn.execute(sql, args).fetchall()
+        return [self._row_to_schedule_log(row) for row in rows]
 
     def track_post(self, tracked_post: TrackedPost) -> None:
         with self._lock:
@@ -1318,6 +1418,16 @@ class SQLiteStore:
             comment_count_at_post=int(row["comment_count_at_post"] or 0),
             comment_count_latest=int(row["comment_count_latest"] or 0),
             is_active=bool(row["is_active"]),
+        )
+
+    @staticmethod
+    def _row_to_schedule_log(row: sqlite3.Row) -> ScheduleLogEntry:
+        return ScheduleLogEntry(
+            id=int(row["id"]),
+            day=_parse_date(row["date"]) or date.today(),
+            planned_actions=dict(_json_loads(row["planned_actions_json"], {})),
+            executed_actions=dict(_json_loads(row["executed_actions_json"], {})),
+            skipped_reason=row["skipped_reason"],
         )
 
     @staticmethod

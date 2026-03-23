@@ -12,7 +12,7 @@ except ImportError:  # pragma: no cover - optional dependency at bootstrap time
 
 
 def _default_interest_config() -> dict[str, Any]:
-    return {"primary": [], "secondary": [], "similarity_threshold": 0.65}
+    return {"primary": [], "secondary": [], "similarity_threshold": 0.40}
 
 
 @dataclass(slots=True)
@@ -24,6 +24,8 @@ class Settings:
     reddit_user_agent: str
     sqlite_db_path: Path
     interests_file: Path
+    claude_projects_dir: Path
+    openclaw_memory_dir: Path
     es_url: str | None
     es_index_posts: str
     es_index_comments: str
@@ -36,8 +38,12 @@ class Settings:
     llm_provider: str
     llm_base_url: str
     llm_model: str
-    claude_api_key: str | None
-    gemini_api_key: str | None
+    scheduler_check_interval_min: int
+    health_karma_decline_days: int
+    health_removal_rate_threshold: float
+    report_email_to: str | None
+    report_output_dir: Path
+    farming_subreddits: list[str]
 
     @classmethod
     def from_env(cls, env_file: str | Path | None = None) -> "Settings":
@@ -51,6 +57,18 @@ class Settings:
         interests_file = _resolve_path(
             os.getenv("INTERESTS_FILE", "./config/interests.example.yaml"), cwd
         )
+        claude_projects_dir = _resolve_path(
+            os.getenv("CLAUDE_PROJECTS_DIR", "/home/ubuntu/.claude/projects"), cwd
+        )
+        openclaw_memory_dir = _resolve_path(
+            os.getenv(
+                "OPENCLAW_MEMORY_DIR", "/home/ubuntu/.openclaw/workspace/memory"
+            ),
+            cwd,
+        )
+        report_output_dir = _resolve_path(
+            os.getenv("REPORT_OUTPUT_DIR", "./logs/daily_reports"), cwd
+        )
         return cls(
             cdp_port=int(os.getenv("CDP_PORT", "9222")),
             display=os.getenv("DISPLAY", ":1"),
@@ -59,6 +77,8 @@ class Settings:
             reddit_user_agent=os.getenv("REDDIT_USER_AGENT", "grow-in-reddit/0.1"),
             sqlite_db_path=sqlite_db_path,
             interests_file=interests_file,
+            claude_projects_dir=claude_projects_dir,
+            openclaw_memory_dir=openclaw_memory_dir,
             es_url=os.getenv("ES_URL"),
             es_index_posts=os.getenv("ES_INDEX_POSTS", "reddit_posts"),
             es_index_comments=os.getenv("ES_INDEX_COMMENTS", "reddit_comments"),
@@ -75,8 +95,23 @@ class Settings:
             llm_provider=os.getenv("LLM_PROVIDER", "chat2api"),
             llm_base_url=os.getenv("LLM_BASE_URL", "http://127.0.0.1:7860"),
             llm_model=os.getenv("LLM_MODEL", "gemini-thinking"),
-            claude_api_key=os.getenv("CLAUDE_API_KEY"),
-            gemini_api_key=os.getenv("GEMINI_API_KEY"),
+            scheduler_check_interval_min=int(
+                os.getenv("SCHEDULER_CHECK_INTERVAL_MIN", "5")
+            ),
+            health_karma_decline_days=int(
+                os.getenv("HEALTH_KARMA_DECLINE_DAYS", "3")
+            ),
+            health_removal_rate_threshold=float(
+                os.getenv("HEALTH_REMOVAL_RATE_THRESHOLD", "0.2")
+            ),
+            report_email_to=os.getenv("REPORT_EMAIL_TO", "liuyl.david@gmail.com"),
+            report_output_dir=report_output_dir,
+            farming_subreddits=_parse_csv(
+                os.getenv(
+                    "FARMING_SUBREDDITS",
+                    "AskReddit,todayilearned,LifeProTips,NoStupidQuestions",
+                )
+            ),
         )
 
     def load_interest_seeds(self) -> dict[str, Any]:
@@ -88,6 +123,10 @@ def _resolve_path(raw_path: str, cwd: Path) -> Path:
     if path.is_absolute():
         return path
     return cwd / path
+
+
+def _parse_csv(raw: str) -> list[str]:
+    return [value.strip() for value in raw.split(",") if value.strip()]
 
 
 def load_interest_config(path: Path) -> dict[str, Any]:
@@ -108,5 +147,5 @@ def load_interest_config(path: Path) -> dict[str, Any]:
     return {
         "primary": interests.get("primary", []),
         "secondary": interests.get("secondary", []),
-        "similarity_threshold": float(interests.get("similarity_threshold", 0.65)),
+        "similarity_threshold": float(interests.get("similarity_threshold", 0.40)),
     }

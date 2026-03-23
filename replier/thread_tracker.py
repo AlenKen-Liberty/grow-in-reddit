@@ -79,6 +79,51 @@ class ThreadTracker:
             )
         return sorted(replies, key=lambda item: item.comment.created_utc)
 
+    def list_pending_replies(self, *, refresh: bool = False) -> list[NewReply]:
+        if refresh:
+            self.check_new_replies()
+        pending = self.sqlite_store.list_seen_comments(reply_status="pending", limit=1000)
+        if not pending:
+            return []
+        pending_by_post: dict[str, set[str]] = {}
+        for item in pending:
+            pending_by_post.setdefault(item.post_url, set()).add(item.comment_id)
+
+        replies: list[NewReply] = []
+        tracked_posts = self.sqlite_store.list_tracked_posts(active_only=True, days=None)
+        tracked_urls = {tracked.url for tracked in tracked_posts}
+        for post_url, pending_ids in pending_by_post.items():
+            if post_url not in tracked_urls:
+                continue
+            detail = self.browser.get_post_detail(post_url)
+            comment_by_id = {
+                comment.id: comment for comment in detail.comments if comment.id
+            }
+            own_comment_ids = {
+                comment.id
+                for comment in detail.comments
+                if (comment.author or "").strip().lower() == self.own_username
+            }
+            for comment_id in pending_ids:
+                comment = comment_by_id.get(comment_id)
+                if comment is None:
+                    continue
+                is_direct_reply = bool(
+                    comment.depth == 0
+                    or (detail.post.id and comment.parent_id == detail.post.id)
+                    or comment.parent_id in own_comment_ids
+                )
+                replies.append(
+                    NewReply(
+                        post_url=post_url,
+                        post=detail.post,
+                        comment=comment,
+                        is_direct_reply=is_direct_reply,
+                        context_chain=self._build_context_chain(comment, comment_by_id),
+                    )
+                )
+        return sorted(replies, key=lambda item: item.comment.created_utc)
+
     def mark_replied(
         self, comment_id: str, *, reply_comment_id: str | None = None
     ) -> None:

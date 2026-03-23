@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 
 from replier import ReplyContext, ReplyGenerator
-from storage import Comment, Post
+from storage import Comment, Post, PostDetail
 
 
 def _build_context() -> ReplyContext:
@@ -50,6 +50,36 @@ class ReplyGeneratorTest(unittest.TestCase):
 
         self.assertTrue(reply)
         self.assertNotIn("boom", reply)
+
+    def test_engagement_reply_falls_back_to_template(self) -> None:
+        generator = ReplyGenerator(use_llm=False)
+        post = Post(
+            url="https://reddit.test/r/swimming/comments/post2",
+            subreddit="r/Swimming",
+            title="What helped you stop crossing over in freestyle?",
+            body="Looking for a cue that worked in real practice.",
+        )
+        detail = PostDetail(
+            post=post,
+            comments=[
+                Comment(
+                    id="t1_one",
+                    post_url=post.url,
+                    author="helper",
+                    body="A coach told me to widen the entry.",
+                )
+            ],
+        )
+
+        reply = generator.generate_engagement_reply(
+            subreddit=post.subreddit,
+            post=post,
+            post_detail=detail,
+            suggested_angle="Answer the core question directly and keep it practical.",
+        )
+
+        self.assertTrue(reply)
+        self.assertIn("starting point", reply.lower())
 
 
 if __name__ == "__main__":

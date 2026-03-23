@@ -6,7 +6,7 @@ from datetime import timedelta
 from typing import Any, Callable
 from urllib import error, request
 
-from storage import Comment, Post
+from storage import Comment, Post, PostDetail
 from storage.models import utc_now
 from utils import extract_preview
 
@@ -61,6 +61,25 @@ class ReplyGenerator:
 
         return self._generate_reply_from_template(context)
 
+    def generate_engagement_reply(
+        self,
+        *,
+        subreddit: str,
+        post: Post,
+        post_detail: PostDetail,
+        suggested_angle: str,
+    ) -> str:
+        if self.use_llm:
+            llm_reply = self._generate_engagement_reply_with_llm(
+                subreddit=subreddit,
+                post=post,
+                post_detail=post_detail,
+                suggested_angle=suggested_angle,
+            )
+            if llm_reply:
+                return llm_reply
+        return self._generate_engagement_template(post, post_detail, suggested_angle)
+
     def _generate_reply_from_template(self, context: ReplyContext) -> str:
         comment_text = (context.comment.body or "").strip()
         post_hint = extract_preview(context.post.title or context.post.body, max_length=80)
@@ -78,6 +97,30 @@ class ReplyGenerator:
 
     def _generate_reply_with_llm(self, context: ReplyContext) -> str | None:
         messages = self._build_llm_messages(context)
+        try:
+            if self._completion_client is not None:
+                content = self._completion_client(messages)
+            else:
+                content = self._request_chat_completion(messages)
+        except Exception:
+            return None
+        cleaned = self._normalize_llm_reply(content)
+        return cleaned or None
+
+    def _generate_engagement_reply_with_llm(
+        self,
+        *,
+        subreddit: str,
+        post: Post,
+        post_detail: PostDetail,
+        suggested_angle: str,
+    ) -> str | None:
+        messages = self._build_engagement_messages(
+            subreddit=subreddit,
+            post=post,
+            post_detail=post_detail,
+            suggested_angle=suggested_angle,
+        )
         try:
             if self._completion_client is not None:
                 content = self._completion_client(messages)
@@ -143,6 +186,45 @@ class ReplyGenerator:
             {"role": "user", "content": prompt},
         ]
 
+    def _build_engagement_messages(
+        self,
+        *,
+        subreddit: str,
+        post: Post,
+        post_detail: PostDetail,
+        suggested_angle: str,
+    ) -> list[dict[str, str]]:
+        top_comments = "\n".join(
+            f"- {extract_preview(comment.body, max_length=180)}"
+            for comment in post_detail.comments[:5]
+            if comment.body
+        ) or "(no notable comments yet)"
+        prompt = (
+            f"Subreddit: {subreddit}\n"
+            f"Post title: {post.title}\n"
+            f"Post body: {extract_preview(post.body, max_length=500)}\n"
+            f"Comment angle: {suggested_angle}\n"
+            f"Existing comments:\n{top_comments}\n\n"
+            "Write one natural top-level Reddit comment.\n"
+            "Constraints:\n"
+            "- 1 to 3 sentences\n"
+            "- direct and useful\n"
+            "- sound like a normal experienced user\n"
+            "- no emoji\n"
+            "- no AI disclosure\n"
+            "- plain text only"
+        )
+        return [
+            {
+                "role": "system",
+                "content": (
+                    "You are a normal Reddit user joining a thread with a useful comment. "
+                    "Be concrete and avoid fluff."
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ]
+
     def _request_chat_completion(self, messages: list[dict[str, str]]) -> str:
         payload = {
             "model": self.llm_model,
@@ -189,3 +271,25 @@ class ReplyGenerator:
         if text.startswith('"') and text.endswith('"') and len(text) >= 2:
             text = text[1:-1].strip()
         return text
+
+    @staticmethod
+    def _generate_engagement_template(
+        post: Post,
+        post_detail: PostDetail,
+        suggested_angle: str,
+    ) -> str:
+        title_hint = extract_preview(post.title or post.body, max_length=90).rstrip(".")
+        if "question" in suggested_angle.lower() or "answer" in suggested_angle.lower():
+            return (
+                f"The simplest starting point on {title_hint.lower()} is to keep it specific "
+                "and test one adjustment at a time."
+            )
+        if post_detail.comments:
+            return (
+                f"One thing that stands out to me on {title_hint.lower()} is that the thread still "
+                "needs one concrete example instead of another abstract opinion."
+            )
+        return (
+            f"My first pass on {title_hint.lower()} would be to keep it simple, "
+            "measure what changes, and avoid over-correcting too early."
+        )

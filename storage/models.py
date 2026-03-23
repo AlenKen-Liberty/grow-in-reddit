@@ -94,6 +94,15 @@ class AccountSnapshot:
 
 
 @dataclass(slots=True)
+class ScheduleLogEntry:
+    day: date
+    planned_actions: dict[str, object] | None = None
+    executed_actions: dict[str, object] | None = None
+    skipped_reason: str | None = None
+    id: int | None = None
+
+
+@dataclass(slots=True)
 class TrackedPost:
     url: str
     subreddit: str

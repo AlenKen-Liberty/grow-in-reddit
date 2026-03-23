@@ -1,1 +1,12 @@
-"""Scheduler package placeholder for Phase 4."""
+from .behavior import BehaviorProfile
+from .planner import DailyPlan, DailyPlanner, PlannedSession, PlannedTask
+from .runner import RedditScheduler
+
+__all__ = [
+    "BehaviorProfile",
+    "DailyPlan",
+    "DailyPlanner",
+    "PlannedSession",
+    "PlannedTask",
+    "RedditScheduler",
+]

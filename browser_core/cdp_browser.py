@@ -22,6 +22,7 @@ class CdpBrowser:
         *,
         wait_selector: str | None = None,
         wait_until: str = "domcontentloaded",
+        isolated: bool = False,
     ) -> Iterator[object]:
         try:
             from playwright.sync_api import sync_playwright
@@ -32,13 +33,17 @@ class CdpBrowser:
 
         with sync_playwright() as playwright:
             browser = playwright.chromium.connect_over_cdp(self.cdp_endpoint)
-            if not browser.contexts:
-                browser.close()
-                raise CdpBrowserError(
-                    f"No browser context found at {self.cdp_endpoint}. Start Chromium with remote debugging first."
-                )
-
-            context = browser.contexts[0]
+            created_context = None
+            if isolated:
+                created_context = browser.new_context()
+                context = created_context
+            else:
+                if not browser.contexts:
+                    browser.close()
+                    raise CdpBrowserError(
+                        f"No browser context found at {self.cdp_endpoint}. Start Chromium with remote debugging first."
+                    )
+                context = browser.contexts[0]
             page = context.new_page()
             try:
                 page.set_default_timeout(self.timeout_ms)
@@ -55,6 +60,9 @@ class CdpBrowser:
             finally:
                 with suppress(Exception):
                     page.close()
+                with suppress(Exception):
+                    if created_context is not None:
+                        created_context.close()
                 with suppress(Exception):
                     browser.close()
 

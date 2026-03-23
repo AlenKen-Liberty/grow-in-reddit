@@ -68,6 +68,43 @@ class ThreadTrackerTest(unittest.TestCase):
         assert seen is not None
         self.assertEqual(seen.reply_status, "pending")
 
+    def test_list_pending_replies_returns_unreplied_items(self) -> None:
+        tracked = TrackedPost(
+            url="https://reddit.test/r/swimming/comments/post2",
+            subreddit="r/Swimming",
+            title="Kick timing question",
+            posted_at=utc_now() - timedelta(hours=2),
+        )
+        self.store.track_post(tracked)
+        detail = PostDetail(
+            post=Post(
+                url=tracked.url,
+                subreddit="r/Swimming",
+                title=tracked.title,
+                id="t3_post2",
+                author="me",
+            ),
+            comments=[
+                Comment(
+                    id="t1_reply2",
+                    post_url=tracked.url,
+                    author="helpful_user",
+                    body="Try a softer two-beat kick first.",
+                    parent_id="t3_post2",
+                    depth=0,
+                )
+            ],
+        )
+        tracker = ThreadTracker(FakeBrowser(detail), self.store, own_username="me")
+
+        tracker.check_new_replies()
+        pending = tracker.list_pending_replies()
+
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0].comment.id, "t1_reply2")
+        tracker.mark_replied("t1_reply2")
+        self.assertEqual(tracker.list_pending_replies(), [])
+
 
 if __name__ == "__main__":
     unittest.main()

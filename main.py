@@ -1,15 +1,21 @@
 from __future__ import annotations
 
 import argparse
+import signal
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib import parse
 
 from collector import ArticleStore, FeedCrawler, InterestMatcher
 from reddit_browser import RedditBrowser, RedditBrowserError, RedditParser, RateLimiter
-from reddit_memory import CommunityIntelligence, CommunityPlaybook, InterestProfiler
+from reddit_memory import (
+    CommunityIntelligence,
+    CommunityPlaybook,
+    InterestProfiler,
+    MemorySeedLoader,
+)
 from replier import EngagementFinder, OutcomeTracker, ReplyContext, ReplyGenerator, ThreadTracker
 from settings import Settings
 from storage import AccountSnapshot, ActionLog, SQLiteStore, TrackedPost
@@ -26,7 +32,11 @@ class AppContext:
 
     def seed_config(self) -> dict[str, Any]:
         if self._seed_config is None:
-            self._seed_config = self.settings.load_interest_seeds()
+            base_config = self.settings.load_interest_seeds()
+            self._seed_config = MemorySeedLoader(
+                claude_projects_dir=self.settings.claude_projects_dir,
+                openclaw_memory_dir=self.settings.openclaw_memory_dir,
+            ).augment_seed_config(base_config)
         return self._seed_config
 
 
@@ -126,12 +136,28 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def handle_run(args: argparse.Namespace, context: AppContext) -> int:
-    print("Phase-1 bootstrap is installed.")
+    from scheduler import BehaviorProfile, DailyPlanner, RedditScheduler
+
+    planner = DailyPlanner(
+        context.store,
+        seed_config=context.seed_config(),
+        timezone=context.settings.reddit_timezone,
+        farming_subreddits=context.settings.farming_subreddits,
+    )
+    behavior = BehaviorProfile(timezone=context.settings.reddit_timezone)
+    scheduler = RedditScheduler(context, planner, behavior)
+
     if args.dry_run:
-        print("Scheduler is not implemented yet.")
-        print("Use `collect` to pull content and `status` to inspect local state.")
-    else:
-        print("`run` is still a placeholder. Use `collect` or `status` for now.")
+        plan = planner.generate_plan(force=True)
+        _print_plan(plan)
+        return 0
+
+    signal.signal(signal.SIGINT, lambda *_: scheduler.shutdown())
+    signal.signal(signal.SIGTERM, lambda *_: scheduler.shutdown())
+    print(f"Scheduler started. Timezone: {context.settings.reddit_timezone}")
+    print("Press Ctrl+C to stop.")
+    scheduler.run_forever()
+    print("Scheduler stopped.")
     return 0
 
 
@@ -235,7 +261,17 @@ def handle_status(args: argparse.Namespace, context: AppContext) -> int:
         print("Playbooks: none")
 
     if args.shadowban:
-        print("Shadowban check is not implemented yet.")
+        if not context.settings.reddit_username:
+            print("Shadowban check requires REDDIT_USERNAME.")
+        else:
+            visible = context.browser.is_profile_publicly_visible(
+                context.settings.reddit_username
+            )
+            print(
+                "Shadowban check: profile visible publicly"
+                if visible
+                else "Shadowban check: profile not visible publicly"
+            )
 
     return 0
 
@@ -368,30 +404,14 @@ def handle_browse(args: argparse.Namespace, context: AppContext) -> int:
 
 
 def handle_snapshot(args: argparse.Namespace, context: AppContext) -> int:
-    if not context.settings.reddit_username:
-        print("REDDIT_USERNAME is required for snapshot.")
-        return 2
     try:
-        profile = context.browser.get_user_profile(context.settings.reddit_username)
+        snapshot = _record_account_snapshot(context)
     except RedditBrowserError as exc:
         print(f"Snapshot failed: {exc}")
         return 1
-
-    actions = context.store.list_actions(limit=5000, days=365)
-    active_subreddits = len({action.subreddit for action in actions if action.subreddit})
-    snapshot = AccountSnapshot(
-        day=datetime.now(timezone.utc).date(),
-        karma_post=profile.karma_post,
-        karma_comment=profile.karma_comment,
-        karma_total=profile.karma_total,
-        active_subreddits=active_subreddits,
-        total_posts=sum(1 for action in actions if action.action_type == "post"),
-        total_comments=sum(1 for action in actions if action.action_type == "comment"),
-    )
-    context.store.record_account_snapshot(snapshot)
     print(
-        f"Snapshot recorded for u/{profile.username}: "
-        f"post={profile.karma_post} comment={profile.karma_comment} total={profile.karma_total}"
+        f"Snapshot recorded for u/{context.settings.reddit_username}: "
+        f"post={snapshot.karma_post} comment={snapshot.karma_comment} total={snapshot.karma_total}"
     )
     return 0
 
@@ -440,7 +460,7 @@ def handle_reply(args: argparse.Namespace, context: AppContext) -> int:
         llm_base_url=context.settings.llm_base_url,
         llm_model=context.settings.llm_model,
     )
-    replies = tracker.check_new_replies()
+    replies = tracker.list_pending_replies(refresh=True) if args.auto else tracker.check_new_replies()
     if not replies:
         print("No new replies detected.")
         return 0
@@ -536,6 +556,43 @@ def handle_placeholder(command: str) -> int:
     return 0
 
 
+def handle_nurture(args: argparse.Namespace, context: AppContext) -> int:
+    from scheduler import BehaviorProfile, DailyPlan, DailyPlanner, RedditScheduler
+
+    planner = DailyPlanner(
+        context.store,
+        seed_config=context.seed_config(),
+        timezone=context.settings.reddit_timezone,
+        farming_subreddits=context.settings.farming_subreddits,
+    )
+    phase = args.phase or planner.get_current_phase()
+    session = planner.build_immediate_session(phase=phase)
+    scheduler = RedditScheduler(
+        context,
+        planner,
+        BehaviorProfile(timezone=context.settings.reddit_timezone),
+    )
+    scheduler.current_plan = DailyPlan(
+        date=date.today(),
+        phase=phase,
+        skip_today=False,
+        skip_reason="",
+        sessions=[session],
+    )
+    execution = scheduler.execute_session(session, sleep_between_tasks=False)
+    print(f"Phase: {phase}")
+    print(f"Session: {execution.session.session_type}")
+    for task in execution.session.tasks:
+        target = task.subreddit or "(auto)"
+        print(f"  {task.task_type:12s} {target:18s} {task.result}")
+    if execution.health_report is not None:
+        print(
+            f"Health: {execution.health_report.recommended_action} "
+            f"warnings={len(execution.health_report.warnings)}"
+        )
+    return 0
+
+
 def _seed_subreddits(seed_config: dict[str, Any]) -> list[str]:
     subreddits: set[str] = set()
     for bucket in ("primary", "secondary"):
@@ -557,6 +614,50 @@ def _extract_comment_id(target_url: str) -> str | None:
             value = segments[index + 1]
             return value if value.startswith("t1_") else f"t1_{value}"
     return None
+
+
+def _record_account_snapshot(context: AppContext) -> AccountSnapshot:
+    if not context.settings.reddit_username:
+        raise RedditBrowserError("REDDIT_USERNAME is required for snapshot.")
+    profile = context.browser.get_user_profile(context.settings.reddit_username)
+    actions = context.store.list_actions(limit=5000, days=365)
+    active_subreddits = len({action.subreddit for action in actions if action.subreddit})
+    snapshot = AccountSnapshot(
+        day=datetime.now(timezone.utc).date(),
+        karma_post=profile.karma_post,
+        karma_comment=profile.karma_comment,
+        karma_total=profile.karma_total,
+        active_subreddits=active_subreddits,
+        total_posts=sum(1 for action in actions if action.action_type == "post"),
+        total_comments=sum(1 for action in actions if action.action_type == "comment"),
+    )
+    context.store.record_account_snapshot(snapshot)
+    context.store.log_action(
+        ActionLog(
+            action_type="snapshot",
+            subreddit=None,
+            target_url=f"https://www.reddit.com/user/{profile.username}/",
+            content_preview=f"karma_total={profile.karma_total}",
+        )
+    )
+    return snapshot
+
+
+def _print_plan(plan: Any) -> None:
+    print(f"Date: {plan.date}")
+    print(f"Phase: {plan.phase}")
+    if plan.skip_today:
+        print(f"SKIP: {plan.skip_reason}")
+        return
+    for index, session in enumerate(plan.sessions, start=1):
+        print(
+            f"\nSession {index}: {session.session_type} "
+            f"({session.window_start.isoformat(timespec='minutes')} - "
+            f"{session.window_end.isoformat(timespec='minutes')})"
+        )
+        for task in session.tasks:
+            target = task.subreddit or "(auto)"
+            print(f"  [{task.priority}] {task.task_type:15s} -> {target}")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -584,8 +685,8 @@ def main(argv: list[str] | None = None) -> int:
             return handle_intel(args, context)
         if args.command == "status":
             return handle_status(args, context)
-        if args.command in {"nurture"}:
-            return handle_placeholder(args.command)
+        if args.command == "nurture":
+            return handle_nurture(args, context)
         parser.error(f"Unsupported command: {args.command}")
     finally:
         context.store.close()

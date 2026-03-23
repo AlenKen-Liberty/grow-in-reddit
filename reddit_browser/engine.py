@@ -278,6 +278,28 @@ class RedditBrowser:
                 return self.parser.parse_user_profile(payload["data"])
             return self.parser.parse_user_profile_dom(page, username)
 
+    def is_profile_publicly_visible(self, username: str) -> bool:
+        if not username:
+            raise ValueError("username is required")
+        profile_url = f"{self.base_url}/user/{username}/"
+        with self._cdp_browser.open_page(
+            profile_url,
+            wait_selector="body",
+            isolated=True,
+        ) as page:
+            body_text = page.locator("body").inner_text(timeout=self._cdp_browser.timeout_ms)
+            lowered = body_text.lower()
+            if any(
+                marker in lowered
+                for marker in (
+                    "page not found",
+                    "nobody on reddit goes by that name",
+                    "sorry, nobody on reddit goes by that name",
+                )
+            ):
+                return False
+            return True
+
     def _fetch_json(self, url: str) -> Any:
         req = request.Request(url, headers={"User-Agent": self.user_agent})
         try:

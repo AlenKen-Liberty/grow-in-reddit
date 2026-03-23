@@ -1,1 +1,3 @@
-"""Poster package placeholder for Phase 2."""
+from .draft_manager import Draft, DraftManager
+
+__all__ = ["Draft", "DraftManager"]
